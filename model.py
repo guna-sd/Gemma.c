@@ -1,27 +1,27 @@
 from dataclasses import dataclass
 from typing import Tuple , List
-from .tokenizer import Tokenizer
+from tokenizer import Tokenizer
 import torch
 import torch.nn.functional as F
 from torch import nn
-import argparse
+
 
 @dataclass
 class ModelConfig:
     def __init__(self, **kwargs):
     # default parameters for Gemma 7b model
-        self.dim: int = kwargs.get('dim', 3072) # 2048 for 2b model
-        self.n_layer: int = kwargs.get('n_layer', 28) # 18 for 2b model
-        self.n_heads: int = kwargs.get('n_heads', 16) # 8 for 2b model
-        self.n_kv_heads: int = kwargs.get('n_kv_heads', 16) # 1 for 2b model
+        self.dim: int = kwargs.get('dim', 2048) # 3072 for 7b model
+        self.n_layers: int = kwargs.get('n_layer', 18) # 28 for 7b model
+        self.n_heads: int = kwargs.get('n_heads', 8) # 16 for 7b model
+        self.n_kv_heads: int = kwargs.get('n_kv_heads', 1) # 16 for 7b model
         self.vocab_size: int = kwargs.get('vocab_size', 256000)
         self.max_seq_len : int = kwargs.get('max_seq_len', 8192)
         self.norm_eps : float = kwargs.get('norm_eps',1e-6)
-        self.hidden_dim : int = kwargs.get('hidden_dim', 24576) # 16384 for 2b model
+        self.hidden_dim : int = kwargs.get('hidden_dim', 16384) # 24576 for 7b model
         self.head_dim : int = kwargs.get('head_dim', 256)
 
 class Sampler(nn.Module):
-    def __init__(self, vocab_size : int):
+    def __init__(self):
         super().__init__()
     @torch.no_grad()
     def forward(
@@ -122,7 +122,7 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     return x_out
 
 class Attention(nn.Module):
-    def __init__(self, args : ModelConfig):
+    def __init__(self, args):
         super().__init__()
         self.args = args
         self.n_heads = args.n_heads
@@ -137,7 +137,7 @@ class Attention(nn.Module):
         self.kv_size = self.n_kv_heads * self.head_dim
 
         self.qkv_proj = nn.Linear(self.dim, (self.n_heads + 2*self.n_kv_heads)*self.head_dim,bias=False)
-        self.out_proj = nn.Linear(self.n_heads*self.head_dim, self.dim,bias=False)
+        self.o_proj = nn.Linear(self.n_heads*self.head_dim, self.dim,bias=False)
 
     def forward(self,
                 x : torch.Tensor,
@@ -179,7 +179,7 @@ class Attention(nn.Module):
 
         output = torch.matmul(scores, v)
         output = (output.transpose(1,2).contiguous().view(batch_size, seq_len, -1))
-        output = self.out_proj(output)
+        output = self.o_proj(output)
         return output
 
 class MLP(nn.Module):
@@ -189,21 +189,21 @@ class MLP(nn.Module):
         self.dim = args.dim
         self.hidden_dim = args.hidden_dim
 
-        self.w1 = nn.Linear(self.dim, self.hidden_dim, bias=False)
-        self.w2 = nn.Linear(self.hidden_dim, self.dim, bias=False)
-        self.w3 = nn.Linear(self.dim, self.hidden_dim, bias=False)
+        self.gate_proj = nn.Linear(self.dim, self.hidden_dim, bias=False)
+        self.up_proj = nn.Linear(self.dim, self.hidden_dim, bias=False)
+        self.down_proj = nn.Linear(self.hidden_dim, self.dim, bias=False)
     
     def forward(self, x : torch.Tensor) -> torch.Tensor:
-        return self.w2(F.gelu(self.w1(x)) * self.w3(x))
+        return self.down_proj(F.gelu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class GemmaBlock(nn.Module):
     def __init__(self, args : ModelConfig):
         super().__init__()
-        self.self_attn = Attention(ModelConfig)
-        self.mlp = MLP(ModelConfig)
+        self.self_attn = Attention(args)
+        self.mlp = MLP(args)
         self.input_layernorm = RMSNorm(args.dim, eps=args.norm_eps)
-        self.post_layernorm = RMSNorm(args.dim, eps=args)
+        self.post_attention_layernorm = RMSNorm(args.dim, eps=args)
     
     def forward(self,
                 x : torch.Tensor,
@@ -217,7 +217,7 @@ class GemmaBlock(nn.Module):
         x = self.self_attn(x, freqs_cis, kv, cache, mask)
         x = x + res
         res = x
-        x = self.post_layernorm(x)
+        x = self.post_attention_layernorm(x)
         x = self.mlp(x)
         x = x + res
         return x
@@ -231,8 +231,8 @@ class Gemma(nn.Module):
         self.head_dim = args.head_dim
         self.vocab_size = args.vocab_size
         self.num_layers = args.n_layers
-        self.embedding = Embedding(self.vocab_size, args.dim)
-        self.sample = Sampler(self.vocab_size)
+        self.embedder = Embedding(self.vocab_size, args.dim)
+        self.sample = Sampler()
         self.tokenizer = Tokenizer()
 
         self.layers = nn.ModuleList()
@@ -241,8 +241,8 @@ class Gemma(nn.Module):
         self.layernorm = RMSNorm(args.dim, eps=args.norm_eps)
 
         rope_theta = 10000.0
-        freq_cis = precompute_freqs_cis(self.head_dim, args.max_seq_len * 2, theta=rope_theta)
-        self.register_buffer("freq_cis", freq_cis)
+        freqs_cis = precompute_freqs_cis(self.head_dim, args.max_seq_len * 2, theta=rope_theta)
+        self.register_buffer("freqs_cis", freqs_cis)
 
     @torch.no_grad()
     def forward(
@@ -258,17 +258,17 @@ class Gemma(nn.Module):
         top_ks: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        freq_cis = self.freq_cis.index_select(0, input_pos)
+        freq_cis = self.freqs_cis.index_select(0, input_pos)
         kv = input_pos
 
-        x = self.embedding(inputs)
+        x = self.embedder(inputs)
         x = x * (self.args.dim**0.5)
         for i in range(len(self.layers)):
             layer = self.layers[i]
             x = layer(x, freq_cis, kv, caches[i], mask)
         x = self.layernorm(x)
 
-        embedder_weight = self.embedding.weight
+        embedder_weight = self.embedder.weight
         next = self.sample(
             embedder_weight,
             x,
@@ -371,18 +371,5 @@ class Gemma(nn.Module):
         )
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, required=False, default="./model.pt", help='model path if any for inferencing')
-    parser.add_argument('--prompt', type=str, required=True, help='prompt to generate')
-    parser.add_argument('--device', type=str, required=False, help='device to run on')
-    parser.add_argument('--output_length', type=int, required=False, default=128, help='output length')
-    parser.add_argument('--temperature', type=float, required=False, default=1.0, help='temperature')
-    parser.add_argument('--top_k', type=int, required=False, default=70, help='top k')
-    parser.add_argument('--top_p', type=float, required=False, default=1.0, help='top p')
-    args = parser.parse_args()
-    device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    config = ModelConfig()
-    model = Gemma(config)
-    model.load_weights(args.model)
-    result = model.generate(args.prompt, device=device, output_length=args.output_length, temperature=args.temperature, top_k=args.top_k, top_p=args.top_p)
-    print([r for r in result])
+    print("Use python3 run.py to use model")
+    exit(1)
