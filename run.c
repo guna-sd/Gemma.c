@@ -6,7 +6,6 @@
 #include <math.h>
 #include <string.h>
 #include <fcntl.h>
-#include <cblas.h>
 #if defined _WIN32
     #include "win.h"
 #else
@@ -19,7 +18,7 @@ typedef struct {
     int n_layers;
     int n_heads;
     int n_kv_heads;
-    int hiddlen_dim;
+    int hidden_dim;
     int head_dim;
     int vocab_size;
     int max_seq_len;
@@ -45,7 +44,9 @@ typedef struct {
     float *xt;
     float *h;
     float *h2;
-    float *qkv;
+    float *q;
+    float *k;
+    float *v;
     float *attn;
     float *logits;
     float *key_cache;
@@ -61,6 +62,38 @@ typedef struct {
     ssize_t file_size;
 } Transformer;
 
+void alloc_runstate(Runstate *state, Config *params)
+{
+    int kv_size = (params->dim * params->n_kv_heads) / p->n_heads;
+    state->x =  calloc(params->dim, sizeof(float));
+    state->x2 = calloc(params->dim, sizeof(float));
+    state->xt = calloc(params->dim, sizeof(float));
+    state->h =  calloc(params->hidden_dim, sizeof(float));
+    state->h2 =  calloc(params->hidden_dim, sizeof(float));
+    state->q =  calloc(params->hidden_dim, sizeof(float));
+    state->key_cache = calloc(p->n_layers * p->max_seq_len * kv_size, sizeof(float));
+    state->key_cache = calloc(p->n_layers * p->max_seq_len * kv_size, sizeof(float));
+    state->attn = calloc(p->n_heads * p->max_seq_len, sizeof(float));
+    state->logits = calloc(p->vocab_size, sizeof(float));
+    if (!state->x || !state->x2 || !state->xt || !state->h || !state->h2 || !state->q
+     || !state->key_cache || !state->value_cache || !state->attn || !state->logits) {
+        fprintf(stderr, "memmory allocation failed for runstate!\n");
+        exit(EXIT_FAILURE);
+}
+
+void free_runstate(Runstate *state)
+{
+    free(state->x);
+    free(state->x2);
+    free(state->xt);
+    free(state->h);
+    free(state->h2);
+    free(state->q);
+    free(state->attn);
+    free(state->logits);
+    free(state->key_cache);
+    free(state->value_cache);
+}
 
 void matmul(float *out,float *x, float *y, int n, int dim)
 {
@@ -88,7 +121,6 @@ void rms_norm(float *o, float *x, float *w, int dim, float eps) {
         o[i] = x[i] * inv_sqrt * (w + 1.0f);
     }
 }
-
 
 void softmax(float *x, int size)
 {
@@ -145,8 +177,7 @@ void softmax(float *x, int size)
 
 
 
-
-
+/*code for tokenization encode and decode*/
 
 typedef struct {
     char *str;
